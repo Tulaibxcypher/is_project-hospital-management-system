@@ -1,6 +1,7 @@
 # db.py
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 
 DB_NAME = "hospital.db"
 
@@ -37,20 +38,33 @@ def get_user_by_username(username: str):
         return dict(row) if row else None
 
 
-# ---------- PATIENTS ----------
-
-def add_patient(name: str, contact: str, diagnosis: str):
+def update_user_password(username: str, new_password_hash: str):
     """
-    Insert a new patient. Anonymized fields are empty initially.
+    Update user password (used for migrating to hashed passwords).
     """
     with get_connection() as conn:
         conn.execute(
+            "UPDATE users SET password = ? WHERE username = ?",
+            (new_password_hash, username)
+        )
+
+
+# ---------- PATIENTS ----------
+
+def add_patient(name: str, contact: str, diagnosis: str, encrypted: bool = False):
+    """
+    Insert a new patient. Anonymized fields are empty initially.
+    If encrypted=True, diagnosis is already encrypted.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
             """
             INSERT INTO patients (name, contact, diagnosis)
             VALUES (?, ?, ?)
             """,
             (name, contact, diagnosis)
         )
+        return cur.lastrowid
 
 
 def update_patient(patient_id: int, name: str, contact: str, diagnosis: str):
@@ -65,6 +79,17 @@ def update_patient(patient_id: int, name: str, contact: str, diagnosis: str):
             WHERE patient_id = ?
             """,
             (name, contact, diagnosis, patient_id)
+        )
+
+
+def delete_patient(patient_id: int):
+    """
+    Delete a patient record (GDPR right to erasure).
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM patients WHERE patient_id = ?",
+            (patient_id,)
         )
 
 
@@ -100,6 +125,103 @@ def get_all_patients():
             FROM patients
             ORDER BY patient_id DESC
             """
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_patient_by_id(patient_id: int):
+    """
+    Get single patient by ID.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT patient_id, name, contact, diagnosis,
+                   anonymized_name, anonymized_contact,
+                   date_added
+            FROM patients
+            WHERE patient_id = ?
+            """,
+            (patient_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def search_patients(search_term: str):
+    """
+    Search patients by name or diagnosis (admin only).
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT patient_id, name, contact, diagnosis,
+                   anonymized_name, anonymized_contact,
+                   date_added
+            FROM patients
+            WHERE name LIKE ? OR diagnosis LIKE ?
+            ORDER BY patient_id DESC
+            """,
+            (f"%{search_term}%", f"%{search_term}%")
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------- GDPR COMPLIANCE ----------
+
+def delete_old_records(days: int = 90):
+    """
+    Delete patient records older than specified days (GDPR data retention).
+    Returns number of deleted records.
+    """
+    cutoff_date = datetime.now() - timedelta(days=days)
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d %H:%M:%S")
+    
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM patients WHERE date_added < ?",
+            (cutoff_str,)
+        )
+        return cur.rowcount
+
+
+def get_patient_count_by_age():
+    """
+    Get count of records by age (for data retention monitoring).
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN date_added > datetime('now', '-30 days') THEN 1 ELSE 0 END) as last_30_days,
+                SUM(CASE WHEN date_added > datetime('now', '-60 days') THEN 1 ELSE 0 END) as last_60_days,
+                SUM(CASE WHEN date_added > datetime('now', '-90 days') THEN 1 ELSE 0 END) as last_90_days
+            FROM patients
+            """
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def get_patients_for_deletion(days: int = 90):
+    """
+    Get list of patients that will be deleted based on retention policy.
+    """
+    cutoff_date = datetime.now() - timedelta(days=days)
+    cutoff_str = cutoff_date.strftime("%Y-%m-%d %H:%M:%S")
+    
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT patient_id, anonymized_name, date_added
+            FROM patients
+            WHERE date_added < ?
+            ORDER BY date_added ASC
+            """,
+            (cutoff_str,)
         )
         rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -141,3 +263,56 @@ def get_logs(limit: int | None = None):
 
         rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+
+def get_logs_by_action(action: str, limit: int = 100):
+    """
+    Get logs filtered by action type.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT log_id, user_id, role, action, timestamp, details
+            FROM logs
+            WHERE action = ?
+            ORDER BY log_id DESC
+            LIMIT ?
+            """,
+            (action, limit)
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------- CONSENT TRACKING (GDPR) ----------
+
+def add_consent_record(user_id: int, consent_type: str):
+    """
+    Track user consent for GDPR compliance.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO consent_log (user_id, consent_type)
+            VALUES (?, ?)
+            """,
+            (user_id, consent_type)
+        )
+
+
+def get_user_consent(user_id: int):
+    """
+    Check if user has given consent.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT * FROM consent_log
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (user_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
